@@ -1,84 +1,148 @@
-// Simple AI response generator (client-side, no API needed)
-// For production, connect to OpenAI/Claude via Supabase Edge Functions
+// AI response generator using Lovable AI Gateway
 
-interface AIResponse {
+export interface AIResponse {
   text: string;
   action?: string;
 }
 
-const simpleResponses: Record<string, string> = {
-  hello: "Hey! What's up? How can I help you today?",
-  hi: "Hey there! Ready to help. What do you need?",
-  "how are you": "I'm doing great, thanks for asking! What can I do for you?",
-  "what time": `It's currently ${new Date().toLocaleTimeString()}`,
-  "what day": `Today is ${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}`,
-  weather: "I'd need search mode enabled to get real weather data. Want me to turn it on?",
-  thanks: "You're welcome! Let me know if you need anything else.",
-  bye: "See you later! Have a great day!",
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
+
+// Stream chat response from edge function
+export const streamChatResponse = async ({
+  messages,
+  isSearchMode,
+  onDelta,
+  onDone,
+  onError,
+}: {
+  messages: ChatMessage[];
+  isSearchMode: boolean;
+  onDelta: (text: string) => void;
+  onDone: () => void;
+  onError: (error: string) => void;
+}): Promise<void> => {
+  try {
+    const response = await fetch(CHAT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+      },
+      body: JSON.stringify({ messages, isSearchMode }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 429) {
+        onError("I'm getting too many requests right now. Give me a moment!");
+        return;
+      }
+      if (response.status === 402) {
+        onError("AI credits are running low. Please add more credits.");
+        return;
+      }
+      const errorData = await response.json().catch(() => ({}));
+      onError(errorData.error || "Something went wrong. Please try again.");
+      return;
+    }
+
+    if (!response.body) {
+      onError("No response received.");
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // Process line by line
+      let newlineIndex: number;
+      while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+        let line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (line.startsWith(":") || line.trim() === "") continue;
+        if (!line.startsWith("data: ")) continue;
+
+        const jsonStr = line.slice(6).trim();
+        if (jsonStr === "[DONE]") {
+          onDone();
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(jsonStr);
+          const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+          if (content) {
+            onDelta(content);
+          }
+        } catch {
+          // Incomplete JSON, put back and wait for more
+          buffer = line + "\n" + buffer;
+          break;
+        }
+      }
+    }
+
+    // Final flush
+    if (buffer.trim()) {
+      for (let raw of buffer.split("\n")) {
+        if (!raw) continue;
+        if (raw.endsWith("\r")) raw = raw.slice(0, -1);
+        if (raw.startsWith(":") || raw.trim() === "") continue;
+        if (!raw.startsWith("data: ")) continue;
+        const jsonStr = raw.slice(6).trim();
+        if (jsonStr === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(jsonStr);
+          const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+          if (content) onDelta(content);
+        } catch {
+          // Ignore
+        }
+      }
+    }
+
+    onDone();
+  } catch (error) {
+    console.error("Chat stream error:", error);
+    onError("Connection error. Please check your internet and try again.");
+  }
 };
 
-const actionPatterns = [
-  { pattern: /open spotify/i, action: "open_spotify", response: "Opening Spotify for you!" },
-  { pattern: /play .+ on spotify/i, action: "play_spotify", response: "I'll try to play that on Spotify!" },
-  { pattern: /set.* alarm.* (\d+)/i, action: "set_alarm", response: "Setting an alarm for you!" },
-  { pattern: /set.* reminder/i, action: "set_reminder", response: "I'll set that reminder!" },
-  { pattern: /open (.+) app/i, action: "open_app", response: "Opening the app for you!" },
-  { pattern: /call (.+)/i, action: "make_call", response: "Initiating the call..." },
-  { pattern: /send message/i, action: "send_message", response: "Let me help you send that message." },
-  { pattern: /take.* photo/i, action: "take_photo", response: "Opening camera..." },
-  { pattern: /turn on.* flashlight/i, action: "flashlight_on", response: "Turning on the flashlight!" },
-  { pattern: /turn off.* flashlight/i, action: "flashlight_off", response: "Turning off the flashlight." },
-];
-
-const searchModeResponses = [
-  "Let me search for that information...",
-  "Searching the web for accurate data...",
-  "Analyzing multiple sources to get you the best answer...",
-];
-
+// Non-streaming fallback (for quick responses)
 export const generateResponse = async (
   input: string,
   isSearchMode: boolean
 ): Promise<AIResponse> => {
-  const lowerInput = input.toLowerCase().trim();
+  return new Promise((resolve, reject) => {
+    let fullText = "";
 
-  // Check for actions first
-  for (const { pattern, action, response } of actionPatterns) {
-    if (pattern.test(lowerInput)) {
-      return { text: response, action };
-    }
-  }
-
-  // Check simple responses
-  for (const [key, response] of Object.entries(simpleResponses)) {
-    if (lowerInput.includes(key)) {
-      return { text: response };
-    }
-  }
-
-  // Search mode enhanced responses
-  if (isSearchMode) {
-    const searchPrefix = searchModeResponses[Math.floor(Math.random() * searchModeResponses.length)];
-    
-    // Simulate more intelligent response in search mode
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    
-    return {
-      text: `${searchPrefix} Based on my search, I found relevant information about "${input}". In search mode, I can access real-time data and provide more comprehensive answers. Try asking me about current events, detailed topics, or complex questions!`,
-    };
-  }
-
-  // Default response
-  const defaultResponses = [
-    `I understand you're asking about "${input}". For more detailed answers, try enabling Search mode!`,
-    "I'm here to help! Could you tell me more about what you need?",
-    "Interesting question! Enable Search mode for more comprehensive answers.",
-    "I'd be happy to help with that. What specific information do you need?",
-  ];
-
-  return {
-    text: defaultResponses[Math.floor(Math.random() * defaultResponses.length)],
-  };
+    streamChatResponse({
+      messages: [{ role: "user", content: input }],
+      isSearchMode,
+      onDelta: (text) => {
+        fullText += text;
+      },
+      onDone: () => {
+        resolve({ text: fullText || "I didn't catch that. Could you try again?" });
+      },
+      onError: (error) => {
+        reject(new Error(error));
+      },
+    });
+  });
 };
 
 export const getWakeResponse = (): string => {

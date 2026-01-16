@@ -1,14 +1,18 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import WaveVisualizer from "@/components/WaveVisualizer";
 import VoiceButton from "@/components/VoiceButton";
 import StatusIndicator from "@/components/StatusIndicator";
 import ChatMessage from "@/components/ChatMessage";
 import BackgroundOrbs from "@/components/BackgroundOrbs";
 import Header from "@/components/Header";
+import TimerDisplay from "@/components/TimerDisplay";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
 import { useSpeechSynthesis } from "@/hooks/useSpeechSynthesis";
-import { generateResponse, getWakeResponse } from "@/lib/ai";
+import { useTimer, Timer } from "@/hooks/useTimer";
+import { streamChatResponse, getWakeResponse } from "@/lib/ai";
+import { processCommand } from "@/lib/commands";
 import { Radio } from "lucide-react";
+import { toast } from "sonner";
 
 interface Message {
   id: string;
@@ -24,8 +28,53 @@ const Index = () => {
   const [isSearchMode, setIsSearchMode] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [isWakeWordEnabled, setIsWakeWordEnabled] = useState(false);
+  const conversationRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
 
   const { speak, isSpeaking, stop: stopSpeaking } = useSpeechSynthesis();
+
+  // Timer completion handler
+  const handleTimerComplete = useCallback(
+    (timer: Timer) => {
+      const message = `Your ${timer.label} timer is done!`;
+      toast.success(message, { duration: 5000 });
+
+      const assistantMessage: Message = {
+        id: Date.now().toString(),
+        role: "assistant",
+        content: message,
+      };
+      setMessages((prev) => [...prev, assistantMessage]);
+
+      if (!isMuted) {
+        speak(message);
+      }
+
+      // Try to play notification sound
+      try {
+        const audio = new Audio("/notification.mp3");
+        audio.play().catch(() => {
+          // Fallback: use Web Audio API for a beep
+          const ctx = new AudioContext();
+          const oscillator = ctx.createOscillator();
+          const gain = ctx.createGain();
+          oscillator.connect(gain);
+          gain.connect(ctx.destination);
+          oscillator.frequency.value = 800;
+          gain.gain.value = 0.3;
+          oscillator.start();
+          setTimeout(() => {
+            oscillator.stop();
+            ctx.close();
+          }, 300);
+        });
+      } catch {
+        // Silent fallback
+      }
+    },
+    [isMuted, speak]
+  );
+
+  const { timers, addTimer, removeTimer } = useTimer(handleTimerComplete);
 
   const handleUserInput = useCallback(
     async (transcript: string) => {
@@ -35,29 +84,102 @@ const Index = () => {
         content: transcript,
       };
       setMessages((prev) => [...prev, userMessage]);
-      setStatus("thinking");
 
-      try {
-        const response = await generateResponse(transcript, isSearchMode);
+      // Check for local commands first
+      const commandResult = processCommand(transcript);
+
+      if (commandResult.handled && commandResult.response) {
+        // Handle timer action
+        if (commandResult.action?.type === "timer" && commandResult.action.payload) {
+          const { duration, label } = commandResult.action.payload as {
+            duration: number;
+            label: string;
+          };
+          addTimer(duration, label);
+        }
+
+        // Handle app opening (web fallback)
+        if (commandResult.action?.type === "open_app" && commandResult.action.payload) {
+          const app = (commandResult.action.payload as { app: string }).app;
+          const appUrls: Record<string, string> = {
+            spotify: "https://open.spotify.com",
+            youtube: "https://youtube.com",
+            google: "https://google.com",
+            twitter: "https://twitter.com",
+            x: "https://x.com",
+            gmail: "https://mail.google.com",
+            maps: "https://maps.google.com",
+          };
+          const url = appUrls[app];
+          if (url) {
+            window.open(url, "_blank");
+          }
+        }
 
         const assistantMessage: Message = {
           id: (Date.now() + 1).toString(),
           role: "assistant",
-          content: response.text,
+          content: commandResult.response,
         };
         setMessages((prev) => [...prev, assistantMessage]);
 
         if (!isMuted) {
           setStatus("speaking");
-          speak(response.text);
+          speak(commandResult.response);
         } else {
           setStatus("idle");
         }
-      } catch {
-        setStatus("idle");
+        return;
       }
+
+      // Use AI for non-command queries
+      setStatus("thinking");
+
+      // Update conversation history
+      conversationRef.current.push({ role: "user", content: transcript });
+
+      // Create placeholder for streaming response
+      const assistantId = (Date.now() + 1).toString();
+      let fullResponse = "";
+
+      setMessages((prev) => [
+        ...prev,
+        { id: assistantId, role: "assistant", content: "" },
+      ]);
+
+      await streamChatResponse({
+        messages: conversationRef.current,
+        isSearchMode,
+        onDelta: (text) => {
+          fullResponse += text;
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId ? { ...m, content: fullResponse } : m
+            )
+          );
+        },
+        onDone: () => {
+          conversationRef.current.push({ role: "assistant", content: fullResponse });
+
+          if (!isMuted && fullResponse) {
+            setStatus("speaking");
+            speak(fullResponse);
+          } else {
+            setStatus("idle");
+          }
+        },
+        onError: (error) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId ? { ...m, content: error } : m
+            )
+          );
+          setStatus("idle");
+          toast.error(error);
+        },
+      });
     },
-    [isSearchMode, isMuted, speak]
+    [isSearchMode, isMuted, speak, addTimer]
   );
 
   const handleWakeWord = useCallback(() => {
@@ -134,6 +256,7 @@ const Index = () => {
   return (
     <div className="min-h-screen flex flex-col bg-background">
       <BackgroundOrbs />
+      <TimerDisplay timers={timers} onRemove={removeTimer} />
 
       <Header
         isSearchMode={isSearchMode}
@@ -151,6 +274,10 @@ const Index = () => {
               <p className="text-muted-foreground text-sm">
                 Your voice assistant. Say "Yo buddy, wake up!" or tap the mic.
               </p>
+              <div className="mt-6 text-xs text-muted-foreground/70 space-y-1">
+                <p>Try: "What time is it?" • "Set a timer for 5 minutes"</p>
+                <p>"Calculate 25 times 4" • "Open YouTube"</p>
+              </div>
             </div>
           )}
 
