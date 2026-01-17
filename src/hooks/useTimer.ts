@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from "react";
+import { showNotification, vibrate, isNative } from "@/lib/native";
 
 export interface Timer {
   id: string;
@@ -7,6 +8,7 @@ export interface Timer {
   remaining: number; // Seconds remaining
   isComplete: boolean;
   createdAt: number;
+  notificationId?: number;
 }
 
 interface UseTimerReturn {
@@ -28,6 +30,7 @@ export const useTimer = (onComplete?: (timer: Timer) => void): UseTimerReturn =>
 
   const addTimer = useCallback((duration: number, label: string): string => {
     const id = `timer-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const notificationId = Math.floor(Math.random() * 100000);
 
     const newTimer: Timer = {
       id,
@@ -36,6 +39,7 @@ export const useTimer = (onComplete?: (timer: Timer) => void): UseTimerReturn =>
       remaining: duration,
       isComplete: false,
       createdAt: Date.now(),
+      notificationId,
     };
 
     setTimers((prev) => [...prev, newTimer]);
@@ -54,6 +58,41 @@ export const useTimer = (onComplete?: (timer: Timer) => void): UseTimerReturn =>
             intervalsRef.current.delete(id);
 
             const completedTimer = { ...t, remaining: 0, isComplete: true };
+
+            // Show native notification
+            showNotification(
+              "⏰ Timer Complete!",
+              `Your ${t.label} timer is done!`
+            );
+
+            // Vibrate on native
+            if (isNative()) {
+              vibrate([200, 100, 200, 100, 200]);
+            }
+
+            // Play notification sound
+            try {
+              const audio = new Audio("/notification.mp3");
+              audio.play().catch(() => {
+                // Fallback: use Web Audio API for a gentle chime
+                const ctx = new AudioContext();
+                const oscillator = ctx.createOscillator();
+                const gain = ctx.createGain();
+                oscillator.connect(gain);
+                gain.connect(ctx.destination);
+                oscillator.type = "sine";
+                oscillator.frequency.setValueAtTime(523.25, ctx.currentTime); // C5
+                oscillator.frequency.setValueAtTime(659.25, ctx.currentTime + 0.15); // E5
+                oscillator.frequency.setValueAtTime(783.99, ctx.currentTime + 0.3); // G5
+                gain.gain.setValueAtTime(0.3, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+                oscillator.start(ctx.currentTime);
+                oscillator.stop(ctx.currentTime + 0.5);
+                setTimeout(() => ctx.close(), 600);
+              });
+            } catch {
+              // Silent fallback
+            }
 
             // Call completion callback
             if (onCompleteRef.current) {
@@ -103,7 +142,7 @@ export const useTimer = (onComplete?: (timer: Timer) => void): UseTimerReturn =>
     removeTimer,
     clearAllTimers,
   };
-};
+}
 
 // Format seconds to MM:SS or HH:MM:SS
 export const formatTime = (seconds: number): string => {

@@ -11,6 +11,7 @@ import { useSpeechSynthesis } from "@/hooks/useSpeechSynthesis";
 import { useTimer, Timer } from "@/hooks/useTimer";
 import { streamChatResponse, getWakeResponse } from "@/lib/ai";
 import { processCommand } from "@/lib/commands";
+import { openApp, initNative } from "@/lib/native";
 import { Radio } from "lucide-react";
 import { toast } from "sonner";
 
@@ -29,6 +30,11 @@ const Index = () => {
   const [isMuted, setIsMuted] = useState(false);
   const [isWakeWordEnabled, setIsWakeWordEnabled] = useState(false);
   const conversationRef = useRef<{ role: "user" | "assistant"; content: string }[]>([]);
+
+  // Initialize native capabilities
+  useEffect(() => {
+    initNative();
+  }, []);
 
   const { speak, isSpeaking, stop: stopSpeaking } = useSpeechSynthesis();
 
@@ -98,22 +104,10 @@ const Index = () => {
           addTimer(duration, label);
         }
 
-        // Handle app opening (web fallback)
+        // Handle app opening (uses native deep links on mobile)
         if (commandResult.action?.type === "open_app" && commandResult.action.payload) {
           const app = (commandResult.action.payload as { app: string }).app;
-          const appUrls: Record<string, string> = {
-            spotify: "https://open.spotify.com",
-            youtube: "https://youtube.com",
-            google: "https://google.com",
-            twitter: "https://twitter.com",
-            x: "https://x.com",
-            gmail: "https://mail.google.com",
-            maps: "https://maps.google.com",
-          };
-          const url = appUrls[app];
-          if (url) {
-            window.open(url, "_blank");
-          }
+          openApp(app);
         }
 
         const assistantMessage: Message = {
